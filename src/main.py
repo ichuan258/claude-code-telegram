@@ -41,6 +41,8 @@ from src.storage.session_storage import SQLiteSessionStorage
 
 def setup_logging(debug: bool = False) -> None:
     """Configure structured logging."""
+    from .utils.redact import install_root_filter, structlog_redact_processor
+
     level = logging.DEBUG if debug else logging.INFO
 
     # Configure standard logging
@@ -50,7 +52,10 @@ def setup_logging(debug: bool = False) -> None:
         stream=sys.stdout,
     )
 
-    # Configure structlog
+    # Mask bot token in any record from httpx, python-telegram-bot, etc.
+    install_root_filter()
+
+    # Configure structlog (redact processor runs first so all renderers see masked values)
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -61,6 +66,7 @@ def setup_logging(debug: bool = False) -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
+            structlog_redact_processor,
             (
                 structlog.processors.JSONRenderer()
                 if not debug

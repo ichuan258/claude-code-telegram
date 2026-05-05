@@ -327,6 +327,7 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("mkdir", self.agentic_mkdir),
             ("usage", self.agentic_usage),
             ("model", self.agentic_model),
             ("effort", self.agentic_effort),
@@ -471,6 +472,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("mkdir", "Create new project dir and switch to it"),
                 BotCommand("usage", "Show Anthropic quota utilization"),
                 BotCommand("model", "Switch model (sonnet/opus/haiku/default)"),
                 BotCommand("effort", "Set effort (low/medium/high/max/default)"),
@@ -1827,6 +1829,62 @@ class MessageOrchestrator:
             f"Set {self.settings.voice_provider_api_key_env} "
             f"for {self.settings.voice_provider_display_name} and install "
             'voice extras with: pip install "claude-code-telegram[voice]"'
+        )
+
+    async def agentic_mkdir(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Create a new project dir under APPROVED_DIRECTORY and switch to it.
+
+        /mkdir <name>
+        """
+        msg = update.effective_message
+        if msg is None:
+            return
+        text = msg.text or ""
+        args = text.split()[1:]
+        base = self.settings.approved_directory
+
+        if not args:
+            await msg.reply_text(
+                "<b>📁 新建项目目录</b>\n"
+                "<pre>用法: /mkdir &lt;name&gt;</pre>\n"
+                f"<i>在 {escape_html(str(base))} 下创建并切换</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        name = args[0]
+        if "/" in name or ".." in name or name.startswith(".") or not name.strip():
+            await msg.reply_text(
+                f"❌ 名称不合法: <code>{escape_html(name)}</code>\n"
+                "<i>不能含 / 或 .., 不能以 . 开头</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        target = base / name
+        if target.exists():
+            await msg.reply_text(
+                f"❌ 已存在: <code>{escape_html(name)}</code>\n"
+                f"<i>用 /repo {escape_html(name)} 切换过去</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            target.mkdir(parents=False)
+        except OSError as e:
+            await msg.reply_text(f"❌ 创建失败: {escape_html(str(e))}")
+            return
+
+        context.user_data["current_directory"] = target
+        context.user_data["claude_session_id"] = None  # fresh dir, fresh session
+        await msg.reply_text(
+            f"<b>📁 新建项目目录</b>\n"
+            f"<pre>已创建: {escape_html(name)}/</pre>\n"
+            f"<i>已切换到该目录,下一条消息生效</i>",
+            parse_mode="HTML",
         )
 
     async def agentic_repo(

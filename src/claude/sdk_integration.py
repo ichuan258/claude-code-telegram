@@ -325,6 +325,7 @@ class ClaudeSDKManager:
                 max_turns=self.config.claude_max_turns,
                 model=model_override or self.config.claude_model or None,
                 effort=effort_override,  # type: ignore[arg-type]
+                permission_mode="bypassPermissions",
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,
@@ -337,7 +338,9 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                # Load user + project + local so ~/.claude skills, agents,
+                # plugins, hooks become available — same scope as `claude` CLI.
+                setting_sources=["user", "project", "local"],
                 stderr=_stderr_callback,
             )
 
@@ -349,13 +352,9 @@ class ClaudeSDKManager:
                     mcp_config_path=str(self.config.mcp_config_path),
                 )
 
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
-                )
+            # Tool gating disabled — permission_mode=bypassPermissions above
+            # already grants full access. Skip can_use_tool to match shell CLI
+            # behavior with --dangerously-skip-permissions.
 
             # Resume previous session if we have a session_id
             if session_id and continue_session:
