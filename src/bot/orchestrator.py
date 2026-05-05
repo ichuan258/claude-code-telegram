@@ -324,6 +324,7 @@ class MessageOrchestrator:
         handlers = [
             ("start", self.agentic_start),
             ("new", self.agentic_new),
+            ("clear", self.agentic_clear),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
@@ -468,7 +469,8 @@ class MessageOrchestrator:
         if self.settings.agentic_mode:
             commands = [
                 BotCommand("start", "Start the bot"),
-                BotCommand("new", "Start a fresh session"),
+                BotCommand("new", "Full reset: context + dir + model/effort"),
+                BotCommand("clear", "Clear conversation context only"),
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
@@ -558,15 +560,93 @@ class MessageOrchestrator:
             parse_mode="HTML",
         )
 
-    async def agentic_new(
+    _CTX_LIMIT_TOKENS = 200_000  # Claude 4.x context window (matches CC CLI)
+
+    def _git_status(self, path) -> Optional[str]:
+        """Return 'branch+N' if path is a git repo (N = dirty file count), else None."""
+        import subprocess
+        try:
+            branch = subprocess.run(
+                ["git", "-C", str(path), "branch", "--show-current"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if branch.returncode != 0:
+                return None
+            name = branch.stdout.strip() or "detached"
+            dirty = subprocess.run(
+                ["git", "-C", str(path), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=2,
+            )
+            count = len([line for line in dirty.stdout.splitlines() if line.strip()])
+            return f"{name}+{count}" if count else name
+        except Exception:
+            return None
+
+    def _build_status_footer(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """One-line status: 📂 dir · 🌿 git · 🤖 model · ⚡ effort · 💬 ctx."""
+        parts: List[str] = []
+
+        cur = context.user_data.get("current_directory", self.settings.approved_directory)
+        try:
+            rel = cur.relative_to(self.settings.approved_directory)
+            # When at the workspace root itself, show the workspace folder name
+            dir_short = str(rel) if str(rel) != "." else self.settings.approved_directory.name
+        except Exception:
+            dir_short = cur.name or str(cur)
+        parts.append(f"📂 {dir_short}")
+
+        git = self._git_status(cur)
+        if git:
+            parts.append(f"🌿 {git}")
+
+        model = context.user_data.get("claude_model") or self.settings.claude_model or "default"
+        parts.append(f"🤖 {model}")
+
+        effort = context.user_data.get("claude_effort")
+        if effort:
+            parts.append(f"⚡ {effort}")
+
+        if usage:
+            inp = usage.get("input_tokens", 0) or 0
+            out = usage.get("output_tokens", 0) or 0
+            cache_r = usage.get("cache_read_input_tokens", 0) or 0
+            cache_c = usage.get("cache_creation_input_tokens", 0) or 0
+            ctx_total = inp + out + cache_r + cache_c
+            if ctx_total > 0:
+                pct = round(ctx_total / self._CTX_LIMIT_TOKENS * 100)
+                # Match CC CLI: `[ctx: 35%]` with mild warning emoji past the
+                # auto-compact threshold so user can /clear before being forced.
+                warn = " ⚠️" if 60 <= pct < 80 else " 🔴" if pct >= 80 else ""
+                parts.append(f"[ctx: {pct}%{warn}]")
+
+        return " · ".join(parts)
+
+    async def agentic_clear(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Reset session, one-line confirmation."""
+        """Clear conversation context only. Keeps dir / model / effort."""
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
+        await update.message.reply_text("🧹 Context cleared.")
 
-        await update.message.reply_text("Session reset. What's next?")
+    async def agentic_new(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Full reset: context + dir back to default + drop model/effort overrides."""
+        context.user_data["claude_session_id"] = None
+        context.user_data["session_started"] = True
+        context.user_data["force_new_session"] = True
+        context.user_data["current_directory"] = self.settings.approved_directory
+        context.user_data.pop("claude_model", None)
+        context.user_data.pop("claude_effort", None)
+        await update.message.reply_text(
+            "🆕 Fresh start: context cleared, dir reset to default, model/effort cleared."
+        )
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1309,6 +1389,9 @@ class MessageOrchestrator:
                     response_content or ""
                 ) + "\n\n_(Interrupted by user)_"
 
+            footer = self._build_status_footer(context, claude_response.usage)
+            response_content = (response_content or "") + f"\n\n———\n{footer}"
+
             formatted_messages = formatter.format_claude_response(response_content)
 
         except Exception as e:
@@ -1536,9 +1619,9 @@ class MessageOrchestrator:
             from .utils.formatting import ResponseFormatter
 
             formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+            footer = self._build_status_footer(context, claude_response.usage)
+            response_content = (claude_response.content or "") + f"\n\n———\n{footer}"
+            formatted_messages = formatter.format_claude_response(response_content)
 
             try:
                 await progress_msg.delete()
@@ -1749,7 +1832,9 @@ class MessageOrchestrator:
         from .utils.formatting import ResponseFormatter
 
         formatter = ResponseFormatter(self.settings)
-        formatted_messages = formatter.format_claude_response(claude_response.content)
+        footer = self._build_status_footer(context, claude_response.usage)
+        response_content = (claude_response.content or "") + f"\n\n———\n{footer}"
+        formatted_messages = formatter.format_claude_response(response_content)
 
         try:
             await progress_msg.delete()

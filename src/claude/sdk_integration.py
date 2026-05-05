@@ -59,6 +59,7 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    usage: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -298,24 +299,34 @@ class ClaudeSDKManager:
                 stderr_lines.append(line)
                 logger.debug("Claude CLI stderr", line=line)
 
-            # Build system prompt, loading CLAUDE.md from working directory if present
-            base_prompt = (
+            # Append-only addition to CC's default system prompt. Using preset
+            # (instead of a raw string) preserves CC's lazy skill loading — a raw
+            # string replaces the default and forces the SDK to inline every skill
+            # body, ballooning the starting context by ~25k tokens.
+            append_text = (
                 f"All file operations must stay within {working_directory}. "
                 "Use relative paths."
             )
             claude_md_path = Path(working_directory) / "CLAUDE.md"
             if claude_md_path.exists():
-                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+                append_text += "\n\n" + claude_md_path.read_text(encoding="utf-8")
                 logger.info(
                     "Loaded CLAUDE.md into system prompt",
                     path=str(claude_md_path),
                 )
+            system_prompt_arg = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": append_text,
+            }
 
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+            # When DISABLE_TOOL_VALIDATION=true, pass empty lists so the SDK
+            # applies no name-based allow/deny filter. permission_mode below
+            # (bypassPermissions) opens the actual gate. Passing None breaks
+            # newer SDK versions ('NoneType' is not iterable).
             if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
+                sdk_allowed_tools: list = []
+                sdk_disallowed_tools: list = []
             else:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
@@ -337,10 +348,12 @@ class ClaudeSDKManager:
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
-                system_prompt=base_prompt,
-                # Load user + project + local so ~/.claude skills, agents,
-                # plugins, hooks become available — same scope as `claude` CLI.
-                setting_sources=["user", "project", "local"],
+                system_prompt=system_prompt_arg,  # type: ignore[arg-type]
+                skills=[],  # suppress eager ~/.claude/skills/ injection (SDK bug workaround)
+                # Skip "user" to avoid CLI eagerly inlining ~/.claude skills
+                # metadata into system prompt (~28k tokens with 349 skills).
+                # Project-level .claude/skills/ in working dir still loads.
+                setting_sources=["project", "local"],
                 stderr=_stderr_callback,
             )
 
@@ -518,11 +531,13 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            usage: Optional[Dict[str, Any]] = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    usage = getattr(message, "usage", None)
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -607,6 +622,7 @@ class ClaudeSDKManager:
                 ),
                 tools_used=tools_used,
                 interrupted=interrupted,
+                usage=usage,
             )
 
         except asyncio.TimeoutError:
