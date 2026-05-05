@@ -327,6 +327,9 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("usage", self.agentic_usage),
+            ("model", self.agentic_model),
+            ("effort", self.agentic_effort),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -385,6 +388,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._handle_stop_callback),
                 pattern=r"^stop:",
+            )
+        )
+
+        # /model and /effort button taps
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_set_callback),
+                pattern=r"^set:",
             )
         )
 
@@ -460,6 +471,9 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("usage", "Show Anthropic quota utilization"),
+                BotCommand("model", "Switch model (sonnet/opus/haiku/default)"),
+                BotCommand("effort", "Set effort (low/medium/high/max/default)"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -578,6 +592,244 @@ class MessageOrchestrator:
 
         await update.message.reply_text(
             f"📂 {dir_display} · Session: {session_status}{cost_str}"
+        )
+
+    async def agentic_usage(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show real Anthropic-side quota utilization (Mac only)."""
+        from datetime import datetime
+
+        from ..claude.usage_client import UsageClientError, fetch_usage
+
+        try:
+            report = await fetch_usage()
+        except UsageClientError as e:
+            await update.message.reply_text(f"⚠️ Usage unavailable: {e}")
+            return
+        except Exception as e:
+            logger.exception("Unexpected error fetching usage")
+            await update.message.reply_text(f"⚠️ Usage error: {e}")
+            return
+
+        BAR_WIDTH = 12
+
+        def bar(pct: float) -> str:
+            pct = max(0.0, min(100.0, pct))
+            filled = int(round(pct / 100 * BAR_WIDTH))
+            return "█" * filled + "░" * (BAR_WIDTH - filled)
+
+        def reset_text(resets_at: Optional[str]) -> str:
+            if not resets_at:
+                return ""
+            try:
+                reset = datetime.fromisoformat(resets_at).astimezone()
+                secs = (reset - datetime.now(reset.tzinfo)).total_seconds()
+                if secs < 0:
+                    return "已重置"
+                if secs < 3600:
+                    return f"{int(secs / 60)}m"
+                if secs < 86400:
+                    h, rem = divmod(secs, 3600)
+                    return f"{int(h)}h{int(rem // 60):02d}m"
+                return reset.strftime("%m-%d %H:%M")
+            except Exception:
+                return resets_at
+
+        def row(label: str, window: Optional[Any]) -> str:
+            label = label.ljust(8)
+            if window is None:
+                return f"{label} {'░' * BAR_WIDTH}   —"
+            pct_str = f"{window.utilization:>3.0f}%"
+            reset = reset_text(window.resets_at)
+            tail = f" · {reset}" if reset else ""
+            return f"{label} {bar(window.utilization)}  {pct_str}{tail}"
+
+        rows = [
+            row("5h", report.five_hour),
+            row("7d", report.seven_day),
+        ]
+        if report.seven_day_sonnet:
+            rows.append(row("  Sonnet", report.seven_day_sonnet))
+        if report.seven_day_opus:
+            rows.append(row("  Opus", report.seven_day_opus))
+
+        body = "\n".join(rows)
+        text = f"<b>📊 Claude 配额</b>\n<pre>{body}</pre>"
+
+        if report.extra_usage and report.extra_usage.is_enabled:
+            ex = report.extra_usage
+            text += (
+                f"\n<i>Extra: {(ex.utilization or 0):.0f}% · "
+                f"${ex.used_credits or 0:.2f}/${ex.monthly_limit or 0:.2f}</i>"
+            )
+
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    _MODEL_CHOICES = ("sonnet", "opus", "haiku")
+    _EFFORT_CHOICES = ("low", "medium", "high", "max")
+    _CHOICE_META: Dict[str, Dict[str, str]] = {
+        "sonnet": {"emoji": "🎵", "tag": "平衡"},
+        "opus": {"emoji": "🎭", "tag": "最强"},
+        "haiku": {"emoji": "🍃", "tag": "极速"},
+        "low": {"emoji": "🪶", "tag": "省"},
+        "medium": {"emoji": "⚖️", "tag": "平衡"},
+        "high": {"emoji": "🔥", "tag": "强"},
+        "max": {"emoji": "🚀", "tag": "极限"},
+    }
+
+    def _claude_overrides(
+        self, context: ContextTypes.DEFAULT_TYPE
+    ) -> Dict[str, Optional[str]]:
+        """Per-user SDK overrides set via /model and /effort."""
+        return {
+            "model_override": context.user_data.get("claude_model"),
+            "effort_override": context.user_data.get("claude_effort"),
+        }
+
+    def _build_choice_keyboard(
+        self, key: str, choices: tuple, current: Optional[str]
+    ) -> InlineKeyboardMarkup:
+        """Minimal: plain capitalized labels, ✓ marks the active choice."""
+        buttons: list = []
+        row: list = []
+        for c in choices:
+            label = f"✓ {c.capitalize()}" if c == current else c.capitalize()
+            row.append(InlineKeyboardButton(label, callback_data=f"set:{key}:{c}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append(
+            [InlineKeyboardButton("默认", callback_data=f"set:{key}:default")]
+        )
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def _render_panel(
+        header: str, current_display: str, footer: Optional[str] = None
+    ) -> str:
+        """Standard panel: bold emoji header + monospace value + optional footer."""
+        body = f"<b>{header}</b>\n<pre>当前: {current_display}</pre>"
+        if footer:
+            body += f"\n<i>{footer}</i>"
+        return body
+
+    async def _handle_choice_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        key: str,
+        choices: tuple,
+        label: str,
+        header: str,
+        default_display: Optional[str] = None,
+    ) -> None:
+        """Show current value + inline keyboard, or set if arg provided."""
+        msg = update.effective_message
+        if msg is None:
+            return
+        text = msg.text or ""
+        args = text.split()[1:]
+
+        if not args:
+            current = context.user_data.get(key)
+            display = current or default_display or "(default)"
+            await msg.reply_text(
+                self._render_panel(header, display, "点击下方按钮切换"),
+                parse_mode="HTML",
+                reply_markup=self._build_choice_keyboard(key, choices, current),
+            )
+            return
+
+        choice = args[0].lower()
+        await self._apply_choice(msg, context, key, choices, label, header, choice)
+
+    async def _apply_choice(
+        self,
+        target,
+        context: ContextTypes.DEFAULT_TYPE,
+        key: str,
+        choices: tuple,
+        label: str,
+        header: str,
+        choice: str,
+    ) -> str:
+        """Apply a choice (from text arg or button), keep keyboard for re-tap."""
+        if choice == "default":
+            context.user_data.pop(key, None)
+            current = None
+            text = self._render_panel(header, "(default)", "已恢复默认")
+        elif choice not in choices:
+            current = context.user_data.get(key)
+            text = self._render_panel(
+                header,
+                current or "(default)",
+                f"无效选项: {', '.join(choices)}, default",
+            )
+        else:
+            context.user_data[key] = choice
+            current = choice
+            text = self._render_panel(header, choice, "下一条消息生效")
+
+        kb = self._build_choice_keyboard(key, choices, current)
+        if hasattr(target, "edit_message_text"):
+            await target.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await target.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        return text
+
+    async def _handle_set_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle inline keyboard taps for /model and /effort."""
+        query = update.callback_query
+        if query is None or not query.data:
+            return
+        await query.answer()
+
+        # callback_data format: set:<key>:<choice>
+        try:
+            _, key, choice = query.data.split(":", 2)
+        except ValueError:
+            return
+
+        if key == "claude_model":
+            choices, label, header = self._MODEL_CHOICES, "Model", "🤖 Claude 模型"
+        elif key == "claude_effort":
+            choices, label, header = self._EFFORT_CHOICES, "Effort", "⚡ 思考强度"
+        else:
+            return
+
+        await self._apply_choice(query, context, key, choices, label, header, choice)
+
+    async def agentic_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Switch Claude model: /model sonnet|opus|haiku|default."""
+        await self._handle_choice_command(
+            update,
+            context,
+            key="claude_model",
+            choices=self._MODEL_CHOICES,
+            label="Model",
+            header="🤖 Claude 模型",
+            default_display=self.settings.claude_model or None,
+        )
+
+    async def agentic_effort(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Set thinking effort: /effort low|medium|high|max|default."""
+        await self._handle_choice_command(
+            update,
+            context,
+            key="claude_effort",
+            choices=self._EFFORT_CHOICES,
+            label="Effort",
+            header="⚡ 思考强度",
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1014,6 +1266,7 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
                 interrupt_event=interrupt_event,
+                **self._claude_overrides(context),
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1264,6 +1517,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                **self._claude_overrides(context),
             )
 
             if force_new:
@@ -1474,6 +1728,7 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
                 images=images,
+                **self._claude_overrides(context),
             )
         finally:
             heartbeat.cancel()
